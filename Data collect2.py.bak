@@ -1,0 +1,196 @@
+"""Three-channel NI USB-6009 EMG recorder and real-time viewer.
+Run: python app.py
+"""
+import sys, csv, queue, threading, time
+from collections import deque
+from datetime import datetime
+from pathlib import Path
+
+import numpy as np
+from PySide6 import QtCore, QtGui, QtWidgets
+import pyqtgraph as pg
+
+try:
+    import nidaqmx
+    from nidaqmx.constants import AcquisitionType, TerminalConfiguration
+    NIDAQMX_AVAILABLE = True
+except ImportError:
+    NIDAQMX_AVAILABLE = False
+
+APP_TITLE = "EMG Recorder — NI USB-6009"
+COLORS = [(0, 196, 180), (255, 166, 43), (205, 100, 255)]
+
+
+class AcquisitionWorker(threading.Thread):
+    """Acquires blocks in a background thread; never accesses Qt widgets."""
+    def __init__(self, device, channels, fs, terminal, block_size, out_queue, simulate=False):
+        super().__init__(daemon=True)
+        self.device, self.channels, self.fs = device, channels, fs
+        self.terminal, self.block_size, self.out_queue, self.simulate = terminal, block_size, out_queue, simulate
+        self.stop_event = threading.Event()
+        self.error = None
+
+    def stop(self):
+        self.stop_event.set()
+
+    def put(self, values):
+        try:
+            self.out_queue.put_nowait(values)
+        except queue.Full:
+            try: self.out_queue.get_nowait()
+            except queue.Empty: pass
+            try: self.out_queue.put_nowait(values)
+            except queue.Full: pass
+
+    def run(self):
+        if self.simulate:
+            phase = 0.0
+            while not self.stop_event.is_set():
+                t = np.arange(self.block_size) / self.fs + phase
+                phase = t[-1] + 1 / self.fs
+                # EMG-like simulated signal, in volts
+                noise = np.random.normal(0, .008, (3, self.block_size))
+                envelope = .015 + .040 * (np.sin(2*np.pi*.35*t) + 1) / 2
+                values = noise + envelope * np.random.normal(0, 1, (3, self.block_size))
+                self.put(values)
+                time.sleep(self.block_size / self.fs)
+            return
+        if not NIDAQMX_AVAILABLE:
+            self.error = "nidaqmx is not installed. Run: pip install nidaqmx"
+            return
+        try:
+            # "DAQmx default" deliberately makes the same channel call as the
+            # small test script supplied by the user. It lets NI-DAQmx choose the
+            # USB-6009 terminal configuration rather than forcing Differential/RSE.
+            with nidaqmx.Task() as task:
+                for channel in self.channels:
+                    physical_channel = f"{self.device}/{channel}"
+                    if self.terminal == "DAQmx default (recommended)":
+                        task.ai_channels.add_ai_voltage_chan(physical_channel)
+                    else:
+                        term = (TerminalConfiguration.DIFFERENTIAL if self.terminal == "Differential"
+                                else TerminalConfiguration.RSE)
+                        task.ai_channels.add_ai_voltage_chan(physical_channel,
+                            terminal_config=term, min_val=-10.0, max_val=10.0)
+                task.timing.cfg_samp_clk_timing(rate=self.fs,
+                                                sample_mode=AcquisitionType.CONTINUOUS,
+                                                samps_per_chan=max(self.fs, self.block_size * 10))
+                task.start()
+                while not self.stop_event.is_set():
+                    data = task.read(number_of_samples_per_channel=self.block_size, timeout=2.0)
+                    self.put(np.asarray(data, dtype=float))
+        except Exception as exc:
+            self.error = str(exc)
+
+
+class MainWindow(QtWidgets.QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle(APP_TITLE); self.resize(1240, 820)
+        self.worker = None; self.samples = 0; self.recording = False; self.csv_file = None; self.writer = None
+        self.data_queue = queue.Queue(maxsize=25)
+        self.buffers = [deque() for _ in range(3)]
+        self._build_ui()
+        self.timer = QtCore.QTimer(self); self.timer.setInterval(30); self.timer.timeout.connect(self.consume_data)
+        self.timer.start()
+
+    def _build_ui(self):
+        pg.setConfigOptions(antialias=True, background="#10151c", foreground="#d9e1ea")
+        central = QtWidgets.QWidget(); self.setCentralWidget(central)
+        layout = QtWidgets.QHBoxLayout(central); layout.setContentsMargins(10, 10, 10, 10)
+        controls = QtWidgets.QFrame(); controls.setFixedWidth(290); controls.setStyleSheet("QFrame{background:#18212b;border-radius:8px} QLineEdit,QComboBox,QSpinBox{padding:5px;background:#fff;color:#111} QPushButton{padding:8px;font-weight:bold;border-radius:5px}")
+        formbox = QtWidgets.QVBoxLayout(controls); formbox.setSpacing(10)
+        title = QtWidgets.QLabel("<h2>EMG Recorder</h2><p>NI USB-6009 · 3 channels</p>"); formbox.addWidget(title)
+        form = QtWidgets.QFormLayout()
+        self.device = QtWidgets.QLineEdit("Dev1")
+        self.channel_edits = [QtWidgets.QLineEdit(f"ai{i}") for i in range(3)]
+        self.rate = QtWidgets.QSpinBox(); self.rate.setRange(10, 16000); self.rate.setValue(2000); self.rate.setSuffix(" Hz / channel")
+        self.window_s = QtWidgets.QDoubleSpinBox(); self.window_s.setRange(.25, 30); self.window_s.setValue(5); self.window_s.setSingleStep(.5); self.window_s.setSuffix(" s")
+        self.y_min = QtWidgets.QDoubleSpinBox(); self.y_min.setRange(-10.0, 9.99); self.y_min.setValue(-0.20); self.y_min.setDecimals(4); self.y_min.setSingleStep(0.01); self.y_min.setSuffix(" V")
+        self.y_max = QtWidgets.QDoubleSpinBox(); self.y_max.setRange(-9.99, 10.0); self.y_max.setValue(0.20); self.y_max.setDecimals(4); self.y_max.setSingleStep(0.01); self.y_max.setSuffix(" V")
+        self.terminal = QtWidgets.QComboBox(); self.terminal.addItems(["DAQmx default (recommended)", "Differential", "RSE"])
+        self.y_min.valueChanged.connect(self.apply_voltage_scale); self.y_max.valueChanged.connect(self.apply_voltage_scale)
+        form.addRow("Device", self.device)
+        for i, e in enumerate(self.channel_edits): form.addRow(f"Channel {i+1}", e)
+        form.addRow("Sample rate", self.rate); form.addRow("Display window", self.window_s); form.addRow("Voltage minimum", self.y_min); form.addRow("Voltage maximum", self.y_max); form.addRow("Input mode", self.terminal)
+        formbox.addLayout(form)
+        self.start_btn = QtWidgets.QPushButton("▶  Start acquisition"); self.start_btn.setStyleSheet("background:#17a673;color:white"); self.start_btn.clicked.connect(self.start)
+        self.record_btn = QtWidgets.QPushButton("●  Start recording"); self.record_btn.setEnabled(False); self.record_btn.setStyleSheet("background:#d84d57;color:white"); self.record_btn.clicked.connect(self.toggle_record)
+        self.clear_btn = QtWidgets.QPushButton("Clear display"); self.clear_btn.clicked.connect(self.clear)
+        self.simulate = QtWidgets.QCheckBox("Simulation mode (no DAQ)")
+        formbox.addWidget(self.start_btn); formbox.addWidget(self.record_btn); formbox.addWidget(self.clear_btn); formbox.addWidget(self.simulate)
+        self.status = QtWidgets.QLabel("● Ready"); self.status.setWordWrap(True); formbox.addWidget(self.status); formbox.addStretch()
+        note = QtWidgets.QLabel("<small>USB-6009 supports up to 48 kS/s aggregate. 3 × 2,000 Hz = 6 kS/s.</small>"); note.setWordWrap(True); formbox.addWidget(note)
+        layout.addWidget(controls)
+        right = QtWidgets.QVBoxLayout(); layout.addLayout(right, 1)
+        self.plots=[]; self.curves=[]; self.rms_labels=[]
+        for i in range(3):
+            row=QtWidgets.QHBoxLayout(); plot=pg.PlotWidget(title=f"Channel {i+1}  ·  raw EMG voltage")
+            plot.setLabel("left", "Voltage", units="V"); plot.setLabel("bottom", "Time", units="s"); plot.showGrid(x=True,y=True,alpha=.2); plot.setYRange(-.2,.2); plot.setMouseEnabled(x=False, y=True)
+            curve=plot.plot(pen=pg.mkPen(COLORS[i], width=1.2)); row.addWidget(plot, 1)
+            rms=QtWidgets.QLabel("RMS\n— mV"); rms.setFixedWidth(72); rms.setAlignment(QtCore.Qt.AlignCenter); rms.setStyleSheet(f"background:rgb{COLORS[i]}; color:#10151c; font-weight:bold; border-radius:7px;")
+            row.addWidget(rms); right.addLayout(row); self.plots.append(plot); self.curves.append(curve); self.rms_labels.append(rms)
+
+    def start(self):
+        if self.worker: self.stop(); return
+        fs=int(self.rate.value()); channels=[x.text().strip() for x in self.channel_edits]
+        if not self.simulate.isChecked() and (not self.device.text().strip() or any(not c for c in channels)):
+            self.set_status("Enter device and all 3 channel names.", True); return
+        self.clear(); self.samples=0
+        self.worker=AcquisitionWorker(self.device.text().strip(),channels,fs,self.terminal.currentText(),max(20,fs//20),self.data_queue,self.simulate.isChecked())
+        self.worker.start(); self.start_btn.setText("■  Stop acquisition"); self.start_btn.setStyleSheet("background:#66727f;color:white"); self.record_btn.setEnabled(True); self.set_status("Acquiring live data")
+
+    def stop(self):
+        if self.recording: self.toggle_record()
+        if self.worker: self.worker.stop(); self.worker.join(timeout=2); self.worker=None
+        self.start_btn.setText("▶  Start acquisition"); self.start_btn.setStyleSheet("background:#17a673;color:white"); self.record_btn.setEnabled(False); self.set_status("Stopped")
+
+    def toggle_record(self):
+        if not self.recording:
+            Path("recordings").mkdir(exist_ok=True)
+            name=datetime.now().strftime("EMG_%Y%m%d_%H%M%S.csv"); path=Path("recordings") / name
+            self.csv_file=open(path,"w",newline="",encoding="utf-8"); self.writer=csv.writer(self.csv_file)
+            self.writer.writerow(["time_s","channel_1_V","channel_2_V","channel_3_V"]); self.csv_file.flush()
+            self.recording=True; self.record_btn.setText("■  Stop recording"); self.set_status(f"RECORDING → {path}")
+        else:
+            self.csv_file.close(); self.csv_file=None; self.writer=None; self.recording=False; self.record_btn.setText("●  Start recording"); self.set_status("Recording saved in recordings/")
+
+    def consume_data(self):
+        if self.worker and self.worker.error:
+            self.set_status("DAQ error: " + self.worker.error, True); self.stop(); return
+        fs=int(self.rate.value()); got=False
+        while True:
+            try: block=self.data_queue.get_nowait()
+            except queue.Empty: break
+            got=True; n=block.shape[1]; indices=np.arange(self.samples,self.samples+n); self.samples += n
+            if self.recording:
+                self.writer.writerows(zip(indices/fs, block[0], block[1], block[2]))
+            for i in range(3): self.buffers[i].extend(block[i])
+        if self.recording and got: self.csv_file.flush()
+        max_n=max(1,round(self.window_s.value()*fs))
+        for i in range(3):
+            while len(self.buffers[i])>max_n: self.buffers[i].popleft()
+            y=np.asarray(self.buffers[i]); x=(np.arange(len(y))-len(y)+1)/fs
+            self.curves[i].setData(x,y); self.plots[i].setXRange(-self.window_s.value(),0,padding=0)
+            if len(y): self.rms_labels[i].setText(f"RMS\n{np.sqrt(np.mean(y*y))*1000:.2f} mV")
+
+    def apply_voltage_scale(self):
+        """Apply the user-entered vertical display limits in volts to all channels."""
+        low, high = self.y_min.value(), self.y_max.value()
+        if low >= high:
+            self.set_status("Voltage minimum must be lower than voltage maximum.", True)
+            return
+        for plot in self.plots:
+            plot.setYRange(low, high, padding=0)
+        self.set_status(f"Voltage scale set to {low:g} V to {high:g} V")
+
+    def clear(self):
+        self.buffers=[deque() for _ in range(3)]; self.samples=0
+        for curve, lab in zip(self.curves,self.rms_labels): curve.clear(); lab.setText("RMS\n— mV")
+
+    def set_status(self, text, error=False): self.status.setText(("● " if not text.startswith("●") else "")+text); self.status.setStyleSheet("color:#ff7b7b" if error else "color:#b8f5d5")
+    def closeEvent(self,event): self.stop(); event.accept()
+
+if __name__ == "__main__":
+    app=QtWidgets.QApplication(sys.argv); app.setStyle("Fusion")
+    window=MainWindow(); window.show(); sys.exit(app.exec())
