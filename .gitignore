@@ -1,0 +1,31 @@
+# PyInstaller build output
+build/
+dist/
+*.manifest
+
+# The executable is ~70 MB: ship it as a GitHub Release asset, not in git.
+*.exe
+
+# Recorded data
+recordings/
+EMG Recordings/
+*.csv
+
+# Local backups (git history replaces these)
+*.bak
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+desktop.ini
+ehthumbs.db
