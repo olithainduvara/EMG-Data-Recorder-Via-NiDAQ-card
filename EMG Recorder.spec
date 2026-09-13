@@ -49,7 +49,11 @@ a = Analysis(
     ['Data collect2.py'],
     pathex=[],
     binaries=[],
-    datas=[('cover4.jpg', '.'), ('cover5.jpg', '.')] + METADATA,
+    # app_icon.ico is bundled as DATA too, not just passed to icon= below:
+    # icon= sets the .exe file icon, the bundled copy is what Qt loads for
+    # the taskbar and title bar at runtime.
+    datas=[('cover4.jpg', '.'), ('cover5.jpg', '.'),
+           ('app_icon.ico', '.'), ('docs/icon.png', '.')] + METADATA,
     hiddenimports=['pyqtgraph', 'nidaqmx'],
     hookspath=[],
     hooksconfig={},

@@ -47,6 +47,25 @@ except Exception as _exc:
     NIDAQMX_AVAILABLE = False
     NIDAQMX_ERROR = f"{type(_exc).__name__}: {_exc}"
 
+
+def _terminal_config(mode):
+    """Look up a TerminalConfiguration member across nidaqmx releases.
+
+    nidaqmx 1.x renamed DIFFERENTIAL -> DIFF (RSE was kept). Trying a short
+    list of known spellings means a future rename degrades to a clear
+    RuntimeError instead of an AttributeError mid-acquisition.
+    """
+    names = {"Differential": ("DIFFERENTIAL", "DIFF"), "RSE": ("RSE",)}[mode]
+    for name in names:
+        member = getattr(TerminalConfiguration, name, None)
+        if member is not None:
+            return member
+    raise RuntimeError(
+        f"nidaqmx.constants.TerminalConfiguration has none of {names}; "
+        f"this nidaqmx version ({getattr(nidaqmx, '__version__', '?')}) "
+        f"is not supported for '{mode}' mode."
+    )
+
 APP_TITLE = "EMG Recorder — NI USB-6009"
 COLORS = [(0, 196, 180), (255, 166, 43), (205, 100, 255)]
 
@@ -61,6 +80,42 @@ def resource_path(name):
     """
     base = getattr(sys, "_MEIPASS", None)
     return Path(base) / name if base else Path(__file__).resolve().with_name(name)
+
+
+def application_icon():
+    """The window/taskbar icon.
+
+    PyInstaller's --icon only sets the icon Explorer shows for the .exe file.
+    The icon Windows shows in the taskbar and title bar comes from Qt, so it
+    has to be set explicitly or the app gets a generic default.
+
+    The .ico is preferred over the .png: it carries 16-48 px variants, and
+    Windows picks the small ones for the title bar and Alt+Tab. A single large
+    PNG would be downscaled and look soft there.
+    """
+    for name in ("app_icon.ico", "icon.png"):
+        path = resource_path(name)
+        if path.exists():
+            icon = QtGui.QIcon(str(path))
+            if not icon.isNull():
+                return icon
+    return QtGui.QIcon()
+
+
+def claim_taskbar_identity(app_id="Peradeniya.FYP.EMGRecorder.USB6009"):
+    """Give Windows an explicit AppUserModelID.
+
+    Without one, the taskbar groups the window under the host process and
+    shows that process's icon instead of the window icon. Must run before the
+    first window is shown. No-op off Windows.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(app_id)
+    except Exception:
+        pass          # cosmetic only - never block startup over the icon
 
 
 def default_save_dir():
@@ -81,6 +136,9 @@ DISPLAY_POINTS = 1200          # buckets drawn per channel, whatever the window
 RMS_INTERVAL_MS = 100          # how often the RMS labels are repainted
 DEFAULT_RMS_WINDOW = 0.25      # seconds averaged for the RMS readout
 DEFAULT_V_MIN, DEFAULT_V_MAX = -5.0, 5.0
+DEFAULT_NOTCH_HZ = 50.0        # mains frequency (50 Hz here, 60 Hz in the Americas)
+DEFAULT_NOTCH_Q = 30.0         # higher Q = narrower notch = less signal removed
+DEFAULT_NOTCH_HARMONICS = 3    # 50, 100, 150 Hz
 DEVICE_POLL_S = 1.5            # how often the DAQ presence is re-checked
 
 # Field widths — the inputs are sized, not stretched to the panel edge.
@@ -295,6 +353,93 @@ class RmsRing:
 
 
 # --------------------------------------------------------------------------- #
+#  Filtering
+# --------------------------------------------------------------------------- #
+class NotchFilter:
+    """Cascade of second-order IIR notches, one per mains harmonic.
+
+    Uses the RBJ cookbook biquad, which is the same design scipy.signal.iirnotch
+    produces. It is written out here rather than imported so the application
+    keeps no scipy dependency - scipy would roughly double the executable for
+    five lines of algebra.
+
+    State is carried across blocks (Direct Form II transposed), so a continuous
+    stream filters exactly as if it had been one long array. Changing any
+    parameter builds a new filter, which restarts from zero state.
+    """
+
+    def __init__(self, fs, freq, q, harmonics, channels=3):
+        self.fs, self.freq, self.q = float(fs), float(freq), float(q)
+        self.channels = int(channels)
+        self.sections = []
+        nyquist = self.fs / 2.0
+        for k in range(1, max(1, int(harmonics)) + 1):
+            f0 = self.freq * k
+            if f0 >= nyquist:
+                break                      # a notch at or above Nyquist is meaningless
+            self.sections.append(self._biquad(f0))
+        self.reset()
+
+    def _biquad(self, f0):
+        """One notch section, identical to scipy.signal.iirnotch(f0, Q, fs).
+
+        Note this is *not* the RBJ cookbook form (alpha = sin(w0)/2Q): that is
+        an approximation whose -3 dB bandwidth drifts from w0/Q as f0 rises.
+        Using tan(bw/2) makes Q mean exactly what the textbooks say it does, so
+        results match anything analysed with scipy offline.
+        """
+        w0 = 2.0 * math.pi * f0 / self.fs
+        cos_w0 = math.cos(w0)
+        beta = math.tan(w0 / self.q / 2.0)      # gb = 1/sqrt(2) folds to a factor of 1
+        gain = 1.0 / (1.0 + beta)
+        b = (gain, -2.0 * gain * cos_w0, gain)
+        a = (1.0, -2.0 * gain * cos_w0, 2.0 * gain - 1.0)
+        return b, a
+
+    def reset(self):
+        self.z1 = [[0.0] * self.channels for _ in self.sections]
+        self.z2 = [[0.0] * self.channels for _ in self.sections]
+
+    @property
+    def active(self):
+        return bool(self.sections)
+
+    def notch_frequencies(self):
+        return [self.freq * k for k in range(1, len(self.sections) + 1)]
+
+    def describe(self):
+        if not self.sections:
+            return f"no harmonic of {self.freq:g} Hz falls below Nyquist"
+        freqs = ", ".join(f"{f:g}" for f in self.notch_frequencies())
+        return f"{freqs} Hz  ·  Q {self.q:g}"
+
+    def process(self, block):
+        """Filter a (channels, n) block and return a new array.
+
+        The recursion is inherently sequential, so this runs a scalar loop over
+        a Python list: for the few-hundred-sample blocks used here that beats
+        per-sample numpy indexing, which pays ~1 us of overhead per operation.
+        """
+        out = np.array(block, dtype=float, copy=True)
+        rows = out.shape[0]
+        for s, (b, a) in enumerate(self.sections):
+            b0, b1, b2 = b
+            a1, a2 = a[1], a[2]
+            z1_row, z2_row = self.z1[s], self.z2[s]
+            for c in range(rows):
+                z1, z2 = z1_row[c], z2_row[c]
+                data = out[c].tolist()
+                for i, x in enumerate(data):
+                    y = b0 * x + z1
+                    z1 = b1 * x - a1 * y + z2
+                    z2 = b2 * x - a2 * y
+                    data[i] = y
+                out[c] = data
+                z1_row[c], z2_row[c] = z1, z2
+        return out
+
+
+# --------------------------------------------------------------------------- #
 #  Threads
 # --------------------------------------------------------------------------- #
 class DeviceMonitor(QtCore.QObject):
@@ -360,6 +505,7 @@ class AcquisitionWorker(threading.Thread):
         self.stop_event = threading.Event()
         self.error = None
         self.record_queue = None     # set by the GUI while recording
+        self.notch = None            # optional NotchFilter, set by the GUI
         self.dropped = 0             # display blocks skipped (never recorded ones)
         self.total = 0               # samples per channel produced so far
 
@@ -367,6 +513,11 @@ class AcquisitionWorker(threading.Thread):
         self.stop_event.set()
 
     def put(self, values):
+        notch = self.notch                    # atomic read of the attribute
+        if notch is not None:
+            # Filter here, before the block is split between the display and
+            # the recorder, so what is plotted always matches what is saved.
+            values = notch.process(values)
         start = self.total
         self.total += values.shape[1]
         recorder = self.record_queue          # atomic read of the attribute
@@ -421,8 +572,8 @@ class AcquisitionWorker(threading.Thread):
                     if self.terminal == "DAQmx default":
                         task.ai_channels.add_ai_voltage_chan(physical_channel)
                     else:
-                        term = (TerminalConfiguration.DIFFERENTIAL if self.terminal == "Differential"
-                                else TerminalConfiguration.RSE)
+                        term = (_terminal_config("Differential") if self.terminal == "Differential"
+                                else _terminal_config("RSE"))
                         task.ai_channels.add_ai_voltage_chan(physical_channel,
                             terminal_config=term, min_val=-10.0, max_val=10.0)
                 task.timing.cfg_samp_clk_timing(rate=self.fs,
@@ -759,12 +910,16 @@ class DeviceCard(QtWidgets.QFrame):
 class MainWindow(QtWidgets.QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(APP_TITLE); self.resize(1300, 840)
+        self.setWindowTitle(APP_TITLE)
+        self.setMinimumSize(900, 600)   # usable floor if the user un-maximizes
+        self.resize(1300, 840)          # fallback size before the first show
+        self.setWindowIcon(application_icon())
         self.settings = QtCore.QSettings("FYP", "EMGRecorder")
         self.worker = None; self.recorder = None; self.recording = False
         self.record_queue = None; self.record_path = None
         self.fs = 2000; self.samples = 0; self._busy = False
         self._device_edited = False; self._devices = []; self._scan_error = None
+        self.notch = None            # active NotchFilter, or None when off
         self._status_text = "Ready"; self._status_error = False
         self.data_queue = queue.Queue(maxsize=25)
         self.rings = [PeakRing() for _ in range(3)]
@@ -854,6 +1009,19 @@ class MainWindow(QtWidgets.QMainWindow):
         # Set before connecting, so the handler cannot fire while the plots
         # and the status label do not exist yet.
         self.y_min.setValue(DEFAULT_V_MIN); self.y_max.setValue(DEFAULT_V_MAX)
+        self.notch_hz = QtWidgets.QDoubleSpinBox(); self.notch_hz.setRange(1.0, 5000.0); self.notch_hz.setDecimals(1)
+        self.notch_hz.setValue(DEFAULT_NOTCH_HZ); self.notch_hz.setSingleStep(10.0); self.notch_hz.setSuffix(" Hz")
+        self.notch_hz.setToolTip("Mains frequency to remove. 50 Hz in Sri Lanka/Europe/Asia, 60 Hz in the Americas.")
+        self.notch_q = QtWidgets.QDoubleSpinBox(); self.notch_q.setRange(1.0, 200.0); self.notch_q.setDecimals(1)
+        self.notch_q.setValue(DEFAULT_NOTCH_Q); self.notch_q.setSingleStep(5.0)
+        self.notch_q.setToolTip("Quality factor: higher is a narrower notch, so less EMG is removed "
+                                "along with the hum. The -3 dB bandwidth is frequency / Q.")
+        self.notch_harmonics = QtWidgets.QSpinBox(); self.notch_harmonics.setRange(1, 10)
+        self.notch_harmonics.setValue(DEFAULT_NOTCH_HARMONICS)
+        self.notch_harmonics.setToolTip("How many multiples of the mains frequency to notch. "
+                                        "Harmonics at or above Nyquist are skipped automatically.")
+        for _w in (self.notch_hz, self.notch_q, self.notch_harmonics):
+            _w.valueChanged.connect(self.apply_notch_settings)
         self.terminal = QtWidgets.QComboBox(); self.terminal.addItems(TERMINALS)
         self.terminal.setToolTip("DAQmx default is recommended: it lets NI-DAQmx pick "
                                  "the USB-6009 terminal configuration.")
@@ -862,7 +1030,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self.terminal.setMinimumContentsLength(10)
         for _w in (self.device, *self.channel_edits):
             _w.setFixedWidth(FIELD_W)
-        for _w in (self.rate, self.window_s, self.rms_window, self.y_min, self.y_max):
+        for _w in (self.rate, self.window_s, self.rms_window, self.y_min, self.y_max,
+                   self.notch_hz, self.notch_q, self.notch_harmonics):
             _w.setFixedWidth(SPIN_W)
         self.terminal.setFixedWidth(COMBO_W)
         self.y_min.valueChanged.connect(self.apply_voltage_scale)
@@ -886,6 +1055,9 @@ class MainWindow(QtWidgets.QMainWindow):
         add_row("Voltage min", self.y_min)
         add_row("Voltage max", self.y_max)
         add_row("Input mode", self.terminal)
+        add_row("Notch frequency", self.notch_hz)
+        add_row("Notch Q", self.notch_q)
+        add_row("Notch harmonics", self.notch_harmonics)
         formbox.addLayout(form)
 
         # ---- save location ------------------------------------------------ #
@@ -908,9 +1080,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.start_btn = QtWidgets.QPushButton("▶  Start acquisition"); self.start_btn.setObjectName("startButton"); self.start_btn.clicked.connect(self.start)
         self.record_btn = QtWidgets.QPushButton("●  Start recording"); self.record_btn.setObjectName("recordButton"); self.record_btn.setEnabled(False); self.record_btn.clicked.connect(self.toggle_record)
         self.clear_btn = QtWidgets.QPushButton("Clear display"); self.clear_btn.setObjectName("neutralButton"); self.clear_btn.clicked.connect(self.clear)
+        self.notch_btn = QtWidgets.QPushButton(); self.notch_btn.setObjectName("notchButton")
+        self.notch_btn.setCheckable(True)
+        self.notch_btn.setToolTip("Apply a digital IIR notch filter to the live traces and to "
+                                  "everything written to CSV.")
+        self.notch_btn.toggled.connect(self.toggle_notch)
         self.simulate = QtWidgets.QCheckBox("Simulation mode (no DAQ)"); self.simulate.setObjectName("simCheck")
         self.simulate.toggled.connect(self.refresh_device_card)
-        formbox.addWidget(self.start_btn); formbox.addWidget(self.record_btn); formbox.addWidget(self.clear_btn); formbox.addWidget(self.simulate)
+        formbox.addWidget(self.start_btn); formbox.addWidget(self.record_btn)
+        formbox.addWidget(self.notch_btn)
+        formbox.addWidget(self.clear_btn); formbox.addWidget(self.simulate)
         self.status = QtWidgets.QLabel(); self.status.setObjectName("statusLabel"); self.status.setWordWrap(True)
         self.status.setSizePolicy(QtWidgets.QSizePolicy.Ignored, QtWidgets.QSizePolicy.Minimum)
         self.status.setMinimumWidth(60)
@@ -1065,6 +1244,7 @@ class MainWindow(QtWidgets.QMainWindow):
             self._style_plot(plot, i, th)
         self.device_card.set_theme(self.theme_name)
         self._apply_start_button_style()
+        self._style_notch_button()
         self.set_status(self._status_text, self._status_error)
 
     def _style_plot(self, plot, index, th):
@@ -1088,6 +1268,63 @@ class MainWindow(QtWidgets.QMainWindow):
             f"QPushButton#startButton{{color:#ffffff;border:1px solid rgba(255,255,255,0.28);"
             f"background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
             f"stop:0 {top}, stop:1 {bottom})}}")
+
+    # -- notch filter --------------------------------------------------------- #
+    def build_notch(self):
+        """Construct a filter for the current rate and settings, or None if off."""
+        if not self.notch_btn.isChecked():
+            return None
+        return NotchFilter(self.fs, self.notch_hz.value(), self.notch_q.value(),
+                           self.notch_harmonics.value(), channels=3)
+
+    def apply_notch_settings(self):
+        """Rebuild the filter and hand it to the worker.
+
+        A new filter starts from zero state, so changing settings mid-stream
+        produces a brief transient - the alternative is silently filtering with
+        stale coefficients, which is worse.
+        """
+        self.notch = self.build_notch()
+        if self.worker:
+            self.worker.notch = self.notch
+        self._style_notch_button()
+        if self.notch is None:
+            return
+        if not self.notch.active:
+            self.set_status(
+                f"Notch off: {self.notch.describe()} at {self.fs:g} Hz sampling.", True)
+            return
+        self.set_status(f"Notch filter on — {self.notch.describe()}")
+
+    def toggle_notch(self, checked):
+        self.apply_notch_settings()
+        if not checked:
+            self.set_status("Notch filter off — recording raw signal")
+
+    def _style_notch_button(self):
+        on = self.notch_btn.isChecked()
+        active = on and self.notch is not None and self.notch.active
+        # Kept short deliberately: a QPushButton cannot elide, so a long label
+        # sets a minimum width and would widen the whole panel. The frequency
+        # is already on the spin box directly above and in the status line.
+        self.notch_btn.setText("◉  Notch filter ON" if on else "◎  Notch filter OFF")
+        # Amber rather than green: filtering is a deviation from the raw signal
+        # and should read as a state worth noticing, not a default.
+        if on:
+            top, bottom = "rgba(226,150,45,0.92)", "rgba(196,120,24,0.92)"
+            fg, rim = "#ffffff", "rgba(255,255,255,0.30)"
+        else:
+            th = THEMES[self.theme_name]
+            top, bottom = th["glass_hi"], th["glass"]
+            fg, rim = th["glass_fg"], th["glass_rim"]
+        self.notch_btn.setStyleSheet(
+            f"QPushButton#notchButton{{color:{fg};border:1px solid {rim};"
+            f"background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            f"stop:0 {top}, stop:1 {bottom})}}")
+
+    def _set_notch_controls_enabled(self, enabled):
+        for widget in (self.notch_btn, self.notch_hz, self.notch_q, self.notch_harmonics):
+            widget.setEnabled(enabled)
 
     # -- alerts --------------------------------------------------------------- #
     def raise_alert(self, title, detail):
@@ -1237,9 +1474,12 @@ class MainWindow(QtWidgets.QMainWindow):
             try: self.data_queue.get_nowait()
             except queue.Empty: break
         self.worker=AcquisitionWorker(self.device.text().strip(),channels,fs,self.terminal.currentText(),max(20,fs//20),self.data_queue,self.simulate.isChecked())
+        self.notch = self.build_notch()          # fs may have changed; rebuild
+        self.worker.notch = self.notch
         self.worker.start()
         self.clear_alert()
         self._set_inputs_enabled(False)
+        self._style_notch_button()
         self.start_btn.setText("■  Stop acquisition"); self._apply_start_button_style()
         self.record_btn.setEnabled(True); self.set_status("Acquiring live data")
 
@@ -1257,13 +1497,22 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.save_dir.mkdir(parents=True, exist_ok=True)
             except Exception as exc:
                 self.set_status(f"Cannot create {self.save_dir}: {exc}", True); return
-            name=datetime.now().strftime("EMG_%Y%m%d_%H%M%S.csv"); self.record_path=self.save_dir / name
+            stamp = datetime.now().strftime("EMG_%Y%m%d_%H%M%S")
+            # Put the processing in the filename: a CSV of filtered samples that
+            # looks identical to a raw one is a trap months later.
+            if self.notch is not None and self.notch.active:
+                stamp += "_notch%gHz" % self.notch.freq
+            self.record_path = self.save_dir / (stamp + ".csv")
             # Big queue: a slow disk buffers here instead of stalling the UI.
             self.record_queue = queue.Queue(maxsize=4000)
             self.recorder = CsvRecorder(self.record_path, self.fs, self.record_queue)
             self.recorder.start()
             if self.worker: self.worker.record_queue = self.record_queue
-            self.recording=True; self.record_btn.setText("■  Stop recording"); self.set_status(f"RECORDING → {self.record_path}")
+            self.recording=True; self.record_btn.setText("■  Stop recording")
+            # Frozen while recording: a file whose samples change processing
+            # halfway through cannot be analysed, and its name would lie.
+            self._set_notch_controls_enabled(False)
+            self.set_status(f"RECORDING → {self.record_path}")
         else:
             if self.worker: self.worker.record_queue = None
             if self.recorder:
@@ -1274,6 +1523,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 rows, err = 0, None
             self.recorder=None; self.record_queue=None; self.recording=False
             self.record_btn.setText("●  Start recording")
+            self._set_notch_controls_enabled(True)
             if err: self.set_status(f"Recording error: {err}", True)
             else: self.set_status(f"Saved {rows:,} samples → {self.record_path}")
 
@@ -1363,5 +1613,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
 
 if __name__ == "__main__":
-    app=QtWidgets.QApplication(sys.argv); app.setStyle("Fusion")
-    window=MainWindow(); window.show(); sys.exit(app.exec())
+    claim_taskbar_identity()          # must precede the first window
+    app = QtWidgets.QApplication(sys.argv)
+    app.setStyle("Fusion")
+    app.setApplicationName("EMG Recorder")
+    app.setWindowIcon(application_icon())
+    window = MainWindow()
+    window.showMaximized()   # fill the screen instead of a fixed 1300x840
+    sys.exit(app.exec())

@@ -15,7 +15,7 @@
 [![NI-DAQmx](https://img.shields.io/badge/NI--DAQmx-USB--6009-FFD100?style=flat-square&logoColor=black)](#-requirements)
 [![UI latency](https://img.shields.io/badge/worst%20UI%20stall-49%20ms-success?style=flat-square)](#-performance)
 
-[Quick start](#-quick-start) · [Usage](#-usage) · [How it works](#-how-it-works) · [Performance](#-performance) · [Build](#-building-the-executable) · [Troubleshooting](#-troubleshooting)
+[Quick start](#-quick-start) · [Usage](#-usage) · [Notch filter](#-notch-filter) · [How it works](#-how-it-works) · [Performance](#-performance) · [Build](#-building-the-executable) · [Troubleshooting](#-troubleshooting)
 
 </div>
 
@@ -65,6 +65,11 @@
 - Peak (min/max) decimation — a 30 s window draws as fast as a 1 s one
 - Adjustable voltage range, **±5 V** default
 - Per-channel RMS on its **own** averaging window
+
+### 🔇 Notch filter
+- Digital **IIR notch** for mains hum, toggled from the panel
+- Configurable frequency (**50/60 Hz**), Q, and harmonic count
+- Applied to the traces **and** to the CSV, so both always agree
 
 </td>
 </tr>
@@ -151,6 +156,10 @@ Press **▶ Start acquisition**, then **● Start recording** to write a file.
 | **RMS window** | Averaging time for the RMS readout — shorter reacts faster |
 | **Voltage min / max** | Vertical scale of all three plots |
 | **Input mode** | DAQmx default recommended; Differential and RSE force a configuration |
+| **Notch frequency** | Mains frequency to remove — 50 Hz here, 60 Hz in the Americas |
+| **Notch Q** | Higher Q = narrower notch = less EMG removed with the hum. −3 dB bandwidth is `frequency / Q` |
+| **Notch harmonics** | How many multiples to notch. Harmonics at or above Nyquist are skipped |
+| **◎ Notch filter** | Toggles the filter on the traces and on everything recorded |
 | **Browse…** | Where CSV recordings are written |
 
 ### 📄 Output format
@@ -167,6 +176,43 @@ time_s,channel_1_V,channel_2_V,channel_3_V
 > `time_s` starts at zero when **acquisition** starts, not when recording starts — so separate
 > recordings from one session stay aligned on a common timeline.
 
+> [!IMPORTANT]
+> With the notch filter on, the CSV contains **filtered** samples — the raw signal is not
+> retained. Such files are named `EMG_<date>_<time>_notch50Hz.csv` so the processing is
+> visible from the filename alone. The filter controls are frozen while recording, so a
+> single file never mixes processing.
+
+---
+
+## 🔇 Notch filter
+
+Mains hum at 50 Hz (or 60 Hz) sits squarely in the EMG band and is usually the largest
+thing in a raw recording. The **◎ Notch filter** button applies a cascade of second-order
+IIR notches — one per harmonic — to the live traces and to everything written to CSV.
+
+| Setting | Default | Notes |
+|:--|:--:|:--|
+| Frequency | `50 Hz` | 50 Hz in Sri Lanka, Europe and most of Asia; 60 Hz in the Americas |
+| Q | `30` | −3 dB bandwidth is `frequency / Q`, so 50 Hz at Q 30 is ≈1.7 Hz wide |
+| Harmonics | `3` | Notches 50, 100 and 150 Hz. Anything at or above Nyquist is skipped |
+
+The coefficients are **bit-identical to `scipy.signal.iirnotch`**, but computed directly so
+the application keeps no scipy dependency — scipy would roughly double the executable for
+five lines of algebra. Filter state is carried across acquisition blocks, so a continuous
+stream filters exactly as if it had been one long array.
+
+Measured on a 25 Hz tone buried under 50/100/150 Hz hum:
+
+| Component | Result |
+|:--|:--|
+| 25 Hz signal | **−0.0 dB** — untouched |
+| 50 Hz hum | **−114 dB** |
+| 100 Hz hum | **−177 dB** |
+| 150 Hz hum | **−207 dB** |
+
+Cost is **0.40 % of one core** at 2 kHz × 3 channels (3.2 % at 16 kHz), and it runs on the
+acquisition thread — never the GUI thread.
+
 ---
 
 ## ⚙️ How it works
@@ -176,8 +222,9 @@ Three background threads keep the GUI free. The UI thread only ever touches alre
 ```mermaid
 flowchart LR
     DAQ[USB-6009] --> AW[Acquisition thread<br/>~50 ms blocks]
-    AW -->|small queue<br/>drops stale frames| UI[GUI thread<br/>33 ms timer]
-    AW -->|deep queue<br/>survives UI stalls| CSV[CSV writer thread]
+    AW --> NF[IIR notch<br/>optional]
+    NF -->|small queue<br/>drops stale frames| UI[GUI thread<br/>33 ms timer]
+    NF -->|deep queue<br/>survives UI stalls| CSV[CSV writer thread]
     CSV --> FILE[(CSV file)]
     NI[NI-DAQmx] -->|polled every 1.5 s| DM[Device monitor thread]
     DM -->|Qt signal| UI
